@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::apple::{ATHostConnectionRef, get_apple_libraries};
+use crate::corefp;
 use crate::device::{DeviceTransport, ensure_transport_available};
 
 #[link(name = "bcrypt")]
@@ -20,23 +21,79 @@ unsafe extern "system" {
 fn generate_uuid_v4() -> String {
     let mut bytes = [0u8; 16];
     unsafe {
-        let _ = BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), bytes.len() as u32, 2);
+        let _ = BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            2,
+        );
     }
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
     )
 }
 
 pub enum SyncEvent {
     Log(String),
     Done(Result<()>),
+}
+
+/// Read the numeric `ErrorCode` parameter of an AirTraffic message.
+///
+/// Only numbers are accepted: the same param can carry session tokens, which
+/// this must never write to the log.
+fn read_error_code(
+    libs: &std::sync::Arc<crate::apple::AppleLibraries>,
+    msg: crate::apple::CFTypeRef,
+) -> Option<String> {
+    let key = libs.create_cf_string("ErrorCode").ok()?;
+    let param = unsafe { (libs.at_cf_message_get_param)(msg, key.raw) };
+    if param.is_null() {
+        return None;
+    }
+    let bytes = libs.cf_plist_to_bytes(param).ok()?;
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes)).ok()?;
+    numeric_error_code(&value)
+}
+
+/// Normalize a plist value to a numeric error code, if it is one.
+fn numeric_error_code(value: &plist::Value) -> Option<String> {
+    value
+        .as_signed_integer()
+        .map(|n| n.to_string())
+        .or_else(|| value.as_unsigned_integer().map(|n| n.to_string()))
+        .or_else(|| {
+            value.as_string().and_then(|s| {
+                let t = s.trim();
+                if !t.is_empty()
+                    && t.bytes()
+                        .enumerate()
+                        .all(|(i, b)| b.is_ascii_digit() || (i == 0 && b == b'-'))
+                {
+                    Some(t.to_string())
+                } else {
+                    None
+                }
+            })
+        })
 }
 
 pub fn sync_assets_via_airtraffic<L>(
@@ -54,6 +111,13 @@ where
         .map(|(a, b)| (a.to_string(), b.to_string()))
         .collect();
 
+    let total_timeout_secs = if transport == DeviceTransport::Wifi {
+        120
+    } else {
+        60
+    }
+    .max(assets.len() as u64 * 2);
+
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = std::thread::spawn(move || {
         let refs: Vec<(&str, &str)> = assets_owned
@@ -61,30 +125,36 @@ where
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         let tx_log = tx.clone();
-        let res = sync_assets_via_airtraffic_internal(&udid_owned, transport, &refs, move |msg| {
-            let _ = tx_log.send(SyncEvent::Log(msg.to_string()));
-        });
+        let res = sync_assets_via_airtraffic_internal(
+            &udid_owned,
+            transport,
+            &refs,
+            total_timeout_secs,
+            move |msg| {
+                let _ = tx_log.send(SyncEvent::Log(msg.to_string()));
+            },
+        );
         let _ = tx.send(SyncEvent::Done(res));
     });
 
-    let base_timeout_secs = if transport == DeviceTransport::Wifi {
-        120
-    } else {
-        60
-    };
-    let total_timeout_secs = base_timeout_secs.max(assets.len() as u64 * 2);
     let start = std::time::Instant::now();
     loop {
         let elapsed = start.elapsed();
         if elapsed >= Duration::from_secs(total_timeout_secs) {
-            bail!("AirTraffic sync timed out ({}s). 1) Unlock iPhone screen and keep it on. 2) Open Apple Books app on iPhone once. 3) Close iTunes on PC.", total_timeout_secs);
+            bail!(
+                "AirTraffic sync timed out ({}s). 1) Unlock iPhone screen and keep it on. 2) Open Apple Books app on iPhone once. 3) Close iTunes on PC.",
+                total_timeout_secs
+            );
         }
         let timeout = Duration::from_secs(total_timeout_secs) - elapsed;
         match rx.recv_timeout(timeout) {
             Ok(SyncEvent::Log(msg)) => log(&msg),
             Ok(SyncEvent::Done(res)) => return res,
             Err(_) => {
-                bail!("AirTraffic sync timed out ({}s). 1) Unlock iPhone screen and keep it on. 2) Open Apple Books app on iPhone once. 3) Close iTunes on PC.", total_timeout_secs);
+                bail!(
+                    "AirTraffic sync timed out ({}s). 1) Unlock iPhone screen and keep it on. 2) Open Apple Books app on iPhone once. 3) Close iTunes on PC.",
+                    total_timeout_secs
+                );
             }
         }
     }
@@ -94,6 +164,7 @@ fn sync_assets_via_airtraffic_internal<L>(
     udid: &str,
     transport: DeviceTransport,
     assets: &[(&str, &str)],
+    total_timeout_secs: u64,
     mut log: L,
 ) -> Result<()>
 where
@@ -101,6 +172,29 @@ where
 {
     ensure_transport_available(udid, transport)
         .context("Selected device transport disappeared before AirTraffic sync")?;
+
+    // Fail fast when FairPlay is known-broken. Without a valid CoreFP.dll the
+    // host cannot mint a Grappa, so the device takes SyncAllowed and then never
+    // sends ReadyForSync — a hang that burns the whole sync timeout before the
+    // user learns why. Third-party Apple drivers (i4Tools, 3uTools) routinely
+    // leave this state behind.
+    match corefp::probe_core_fp() {
+        corefp::CoreFpHealth::Available { path } => {
+            log(&format!("FairPlay runtime ready: {}", path));
+        }
+        corefp::CoreFpHealth::MissingFile { expected } => {
+            log(&format!(
+                "FairPlay CoreFP.dll missing (registry points at {}). The transfer will likely fail.",
+                expected
+            ));
+            log(corefp::remediation_hint());
+        }
+        corefp::CoreFpHealth::Unresolved => {
+            log("FairPlay CoreFP.dll was not found on this PC. The transfer will likely fail.");
+            log(corefp::remediation_hint());
+        }
+    }
+
     log(&format!(
         "Connecting to iOS AirTraffic service (com.apple.atc) over {}...",
         transport.label()
@@ -113,7 +207,17 @@ where
         bail!("ATHostConnectionCreate failed for UDID: {}", udid);
     }
 
-    let retry_scale = if transport == DeviceTransport::Wifi { 2 } else { 1 };
+    let retry_scale = if transport == DeviceTransport::Wifi {
+        2
+    } else {
+        1
+    };
+    // A wall-clock deadline rather than an attempt count, since
+    // ATHostConnectionReadMessage blocks and a null return would otherwise burn
+    // every attempt in milliseconds. Clamped to the outer sync timeout so the
+    // inner wait can never outlive it: the user-facing error is always the
+    // outer one.
+    let ready_timeout_secs = (90 * retry_scale).min(total_timeout_secs);
     let mut run_sync = || -> Result<()> {
         log("Waiting for SyncAllowed from iPhone (keep screen unlocked)...");
         // 1. Wait for SyncAllowed message
@@ -135,23 +239,49 @@ where
             }
         }
         if !sync_allowed {
-            bail!("AirTraffic: SyncAllowed message not received. Ensure iPhone screen is unlocked and Books app is opened.");
+            bail!(
+                "AirTraffic: SyncAllowed message not received. Ensure iPhone screen is unlocked and Books app is opened."
+            );
         }
 
         log("SyncAllowed received! Handshaking Books sync request...");
         // 2. Send HostInfo
         let mut host_info_dict = HashMap::new();
-        host_info_dict.insert("Type".to_string(), plist::Value::String("iTunes".to_string()));
-        host_info_dict.insert("Version".to_string(), plist::Value::String("13.7.0.161".to_string()));
-        host_info_dict.insert("MacOSVersion".to_string(), plist::Value::String("Windows NT 10.0".to_string()));
-        host_info_dict.insert("SyncHostName".to_string(), plist::Value::String("airlift".to_string()));
-        host_info_dict.insert("LibraryID".to_string(), plist::Value::String(generate_uuid_v4()));
-        host_info_dict.insert("SyncedDataclasses".to_string(), plist::Value::Array(vec![plist::Value::String("Book".to_string())]));
-        host_info_dict.insert("SyncedAssetTypes".to_string(), plist::Value::Array(vec![plist::Value::String("Book".to_string())]));
+        host_info_dict.insert(
+            "Type".to_string(),
+            plist::Value::String("iTunes".to_string()),
+        );
+        host_info_dict.insert(
+            "Version".to_string(),
+            plist::Value::String("13.7.0.161".to_string()),
+        );
+        host_info_dict.insert(
+            "MacOSVersion".to_string(),
+            plist::Value::String("Windows NT 10.0".to_string()),
+        );
+        host_info_dict.insert(
+            "SyncHostName".to_string(),
+            plist::Value::String("airlift".to_string()),
+        );
+        host_info_dict.insert(
+            "LibraryID".to_string(),
+            plist::Value::String(generate_uuid_v4()),
+        );
+        host_info_dict.insert(
+            "SyncedDataclasses".to_string(),
+            plist::Value::Array(vec![plist::Value::String("Book".to_string())]),
+        );
+        host_info_dict.insert(
+            "SyncedAssetTypes".to_string(),
+            plist::Value::Array(vec![plist::Value::String("Book".to_string())]),
+        );
         host_info_dict.insert("Wakeable".to_string(), plist::Value::Boolean(false));
 
         let mut host_info_bytes = Vec::new();
-        plist::to_writer_binary(&mut host_info_bytes, &plist::Value::Dictionary(host_info_dict.into_iter().collect()))?;
+        plist::to_writer_binary(
+            &mut host_info_bytes,
+            &plist::Value::Dictionary(host_info_dict.into_iter().collect()),
+        )?;
         let cf_host_info = libs.create_cf_plist_from_bytes(&host_info_bytes)?;
 
         unsafe {
@@ -161,11 +291,17 @@ where
 
         // 3. Send SyncRequest
         let mut dataclasses_bytes = Vec::new();
-        plist::to_writer_binary(&mut dataclasses_bytes, &plist::Value::Array(vec![plist::Value::String("Book".to_string())]))?;
+        plist::to_writer_binary(
+            &mut dataclasses_bytes,
+            &plist::Value::Array(vec![plist::Value::String("Book".to_string())]),
+        )?;
         let cf_dataclasses = libs.create_cf_plist_from_bytes(&dataclasses_bytes)?;
 
         let mut anchors_bytes = Vec::new();
-        plist::to_writer_binary(&mut anchors_bytes, &plist::Value::Dictionary(HashMap::<String, plist::Value>::new().into_iter().collect()))?;
+        plist::to_writer_binary(
+            &mut anchors_bytes,
+            &plist::Value::Dictionary(HashMap::<String, plist::Value>::new().into_iter().collect()),
+        )?;
         let cf_anchors = libs.create_cf_plist_from_bytes(&anchors_bytes)?;
 
         unsafe {
@@ -178,9 +314,20 @@ where
         }
 
         log("Waiting for ReadyForSync from iPhone...");
-        // 4. Wait for ReadyForSync
+        // 4. Wait for ReadyForSync.
+        //
+        // This is also where a FairPlay failure shows up. When AirTrafficHost
+        // cannot mint a Grappa (CoreFP.dll missing or broken) the device
+        // accepts the session with SyncAllowed and then answers with SyncFailed
+        // — or, on some iOS builds, says nothing at all. Discarding those
+        // messages silently is what made this look like an endless hang, so
+        // every message is logged and SyncFailed/SyncFinished are surfaced with
+        // their ErrorCode.
         let mut ready_for_sync = false;
-        for _ in 0..(20 * retry_scale) {
+        let mut rejection: Option<String> = None;
+        let ready_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout_secs);
+        while std::time::Instant::now() < ready_deadline {
             let msg = unsafe { (libs.at_host_connection_read_message)(conn) };
             if msg.is_null() {
                 sleep(Duration::from_millis(150));
@@ -188,13 +335,52 @@ where
             }
             let name_ref = unsafe { (libs.at_cf_message_get_name)(msg) };
             let name = libs.to_rust_string(name_ref);
-            unsafe { (libs.cf_release)(msg) };
+            if name != "ReadyForSync" {
+                log(&format!("AirTraffic message: {}", name));
+            }
             if name == "ReadyForSync" {
+                unsafe { (libs.cf_release)(msg) };
                 ready_for_sync = true;
                 break;
             }
+            if name == "SyncFailed" || name == "SyncFinished" {
+                // Only a numeric code is read; never log the raw message body.
+                let error_code = read_error_code(&libs, msg);
+                unsafe { (libs.cf_release)(msg) };
+                rejection = Some(match error_code {
+                    Some(code) => format!(
+                        "AirTraffic returned {} instead of ReadyForSync. ErrorCode={}",
+                        name, code
+                    ),
+                    None => format!(
+                        "AirTraffic returned {} instead of ReadyForSync. ErrorCode unavailable",
+                        name
+                    ),
+                });
+                break;
+            }
+            unsafe { (libs.cf_release)(msg) };
         }
+
+        if let Some(reason) = rejection {
+            // ErrorCode 4 means the host sent an invalid Grappa blob and 12
+            // means it sent none: both point at the FairPlay/CoreFP layer
+            // rather than at timing.
+            log(&reason);
+            if !corefp::probe_core_fp().is_available() {
+                bail!("{}. {}", reason, corefp::remediation_hint());
+            }
+            bail!(reason);
+        }
+
         if !ready_for_sync {
+            if !corefp::probe_core_fp().is_available() {
+                bail!(
+                    "AirTraffic: ReadyForSync was not received from the device. {}. {}",
+                    "The session was accepted but the iPhone never advanced, which is how a FairPlay/CoreFP failure presents.",
+                    corefp::remediation_hint()
+                );
+            }
             bail!("AirTraffic: ReadyForSync message not received from device");
         }
 
@@ -202,11 +388,18 @@ where
         let mut sync_types_dict = HashMap::new();
         sync_types_dict.insert("Book".to_string(), plist::Value::Integer(1.into()));
         let mut sync_types_bytes = Vec::new();
-        plist::to_writer_binary(&mut sync_types_bytes, &plist::Value::Dictionary(sync_types_dict.into_iter().collect()))?;
+        plist::to_writer_binary(
+            &mut sync_types_bytes,
+            &plist::Value::Dictionary(sync_types_dict.into_iter().collect()),
+        )?;
         let cf_sync_types = libs.create_cf_plist_from_bytes(&sync_types_bytes)?;
 
         unsafe {
-            (libs.at_host_connection_send_metadata_sync_finished)(conn, cf_sync_types.raw, cf_anchors.raw);
+            (libs.at_host_connection_send_metadata_sync_finished)(
+                conn,
+                cf_sync_types.raw,
+                cf_anchors.raw,
+            );
         }
 
         // 6. Read AssetManifest
@@ -232,7 +425,10 @@ where
                 break;
             } else if name == "SyncFailed" || name == "SyncFinished" {
                 unsafe { (libs.cf_release)(msg) };
-                bail!("AirTraffic returned unexpected terminating message: {}", name);
+                bail!(
+                    "AirTraffic returned unexpected terminating message: {}",
+                    name
+                );
             }
             unsafe { (libs.cf_release)(msg) };
         }
@@ -251,7 +447,10 @@ where
         let mut available_downloads = Vec::new();
         for entry in book_entries {
             if let Some(dict) = entry.as_dictionary() {
-                let is_dl = dict.get("IsDownload").and_then(|b| b.as_boolean()).unwrap_or(false);
+                let is_dl = dict
+                    .get("IsDownload")
+                    .and_then(|b| b.as_boolean())
+                    .unwrap_or(false);
                 if is_dl {
                     if let Some(asset_id) = dict.get("AssetID").and_then(|s| s.as_string()) {
                         available_downloads.push(asset_id.to_string());

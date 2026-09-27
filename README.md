@@ -29,13 +29,65 @@
 ## ⚠️ Troubleshooting & Driver Repair (If Nothing Works)
 
 > [!TIP]
-> **iPhone not detected, AirTraffic sync hangs, or operation fails?**  
+> **iPhone not detected, AirTraffic sync hangs, or operation fails?**
 > Corrupted or conflicting Apple USB drivers on Windows are the #1 root cause.
 > 1. Download and install **[3uTools](https://www.3u.com/)**.
 > 2. **Disconnect your iPhone** from your PC.
 > 3. In 3uTools, go to **Toolbox ➔ Repair Driver**.
 > 4. Click **Repair Now** and wait for the Apple driver reinstallation to finish.
 > 5. Reconnect your unlocked iPhone, tap **Trust**, and launch **AirCard**.
+
+---
+
+## Stuck at "Waiting for ReadyForSync" / "AirTraffic sync timed out"
+
+If the log stops right after the iPhone sends `SyncAllowed` and then the
+transfer times out, FairPlay is the problem — not the cable and not the app.
+
+AirTraffic requires `CoreFP.dll`, which it locates by reading
+`HKLM\SOFTWARE\Apple Inc.\CoreFP` from the Windows registry. `CoreFP.dll` is
+**not** part of Apple Mobile Device Support — it ships inside iTunes. A machine
+that only ever installed AMDS (or where **i4Tools / 3uTools** overwrote that key
+to point at their own bundled copy, which is usually gone) has no usable CoreFP
+at all. Without it the host cannot mint a FairPlay credential, so the device
+accepts the session with `SyncAllowed` and then never advances the handshake.
+AirCard v1.2.2+ detects this on startup and prints an explicit warning instead
+of leaving you at a silent timeout.
+
+**Check your machine:**
+
+```powershell
+# Quick check — run in an Administrator PowerShell prompt
+(Get-ItemProperty 'HKLM:\SOFTWARE\Apple Inc.\CoreFP' -ErrorAction SilentlyContinue | Format-List *)
+Test-Path "$env:ProgramFiles\Common Files\Apple\Mobile Device Support\CoreFP.dll"
+```
+
+If `Apple Mobile Device Support` is the only Apple thing installed, it is almost
+certainly missing. Fix it in one step:
+
+### Option A — AirCard's own repair (recommended)
+
+```powershell
+# 1) Downloads the OFFICIAL iTunes installer and extracts the genuine
+#    Apple-signed CoreFP.dll. No elevation needed. (~200 MB download)
+powershell -ExecutionPolicy Bypass -File tools\Extract-CoreFP.ps1
+
+# 2) Installs the DLL and repairs the registry. One UAC prompt.
+powershell -ExecutionPolicy Bypass -File tools\Install-CoreFP.ps1
+```
+
+The extract step verifies the DLL's `Apple Inc.` signature before writing it;
+the install step presets `LibraryPath`, removes stale `Libi4CFPath` /
+`LibiiiiPath` values, and backs up the old registry key to
+`%TEMP%\CoreFP-registry-backup.reg` first.
+
+Then **reboot**, reconnect the iPhone, open Apple Books once, and retry.
+
+### Option B — Install official iTunes
+
+Uninstall the i4Tools/3uTools Apple drivers, then install the **official iTunes
+from [apple.com](https://www.apple.com/itunes/)**. The Microsoft Store build
+contains no Mobile Device Support and will not help.
 
 ---
 
@@ -69,7 +121,31 @@ If both transports are available, **Auto** uses USB first and falls back to WiFi
 4. Click **Choose Image...** to pick your artwork (PNG, JPG, or WebP — drag inside the preview to position the crop, then scale it to `1536 × 969`).
 5. Click **Apply Card Skin**.
 6. Force-close the **Wallet** app on your iPhone from the App Switcher (swipe up from bottom, then swipe Wallet away) and reopen Wallet to see your new card!
-7. The first apply stores a local backup of the original card face. Use **Restore Original** later to write it back and invalidate Wallet's cached artwork.
+
+### About "Restore Original"
+
+**Restore Original needs AFC to read the original artwork off the device, and
+current iOS blocks that.** Measured on iPhone17,1 / iOS 26.7 over USB:
+
+```
+com.apple.afc            -> error 8 on every /var path
+com.apple.afc2           -> AMDeviceSecureStartService: -402653150
+com.apple.mobilesync.AFC2-> AMDeviceSecureStartService: -402653150
+```
+
+`com.apple.afc` only exposes the Media sandbox, the AFC2 services are refused,
+and the card bundle lives at `/var/mobile/Library/Passes/Cards/`. So the
+original artwork cannot be copied off the device — **Restore Original stays
+unavailable on these iOS builds.** Applying a skin is unaffected; that path goes
+through AirTraffic, which can still write into the bundle.
+
+Run `aircard.exe probe` to see your device's actual answer. If it reports that a
+service reaches the card directory, the backup and restore buttons work as
+described below.
+
+On builds where AFC can reach `/var`, the first apply does store a local backup
+of the original card face, and **Restore Original** writes it back and
+invalidates Wallet's cached artwork.
 
 ---
 
