@@ -63,7 +63,17 @@ impl AfcClient {
     pub fn new_on_service(session: &ActiveDeviceSession, service: &str) -> Result<Self> {
         let libs = get_apple_libraries()?;
         let service_conn = session.start_service(service)?;
+        Self::from_service_connection(&libs, service_conn)
+    }
 
+    /// Open AFC over a service connection that is already established.
+    ///
+    /// Shared by every way AFC gets a socket, so the secure-context handling is
+    /// identical whichever route was used.
+    pub fn from_service_connection(
+        libs: &std::sync::Arc<AppleLibraries>,
+        service_conn: AMDServiceConnectionRef,
+    ) -> Result<Self> {
         unsafe {
             let socket = (libs.amd_service_connection_get_socket)(service_conn);
             let mut conn: AFCConnectionRef = ptr::null_mut();
@@ -86,7 +96,7 @@ impl AfcClient {
             }
 
             Ok(Self {
-                libs,
+                libs: std::sync::Arc::clone(libs),
                 conn,
                 service_conn,
                 encrypted,
