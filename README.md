@@ -140,32 +140,36 @@ powershell -ExecutionPolicy Bypass -File tools\Install-CoreFP.ps1
 
 ### 关于「恢复原卡面」
 
-> [!IMPORTANT]
-> **在 iOS 26 / 27 上「恢复原卡面」不可用。**
+> [!CAUTION]
+> **应用皮肤前请先想清楚：目前无法恢复原卡面。**
 >
-> 这个功能需要 AFC 把设备上的原始图片读出来，而当前 iOS 封了这条路。
-> 在 iPhone17,1 / iOS 26.7 上实测：
+> 「恢复原卡面」需要把设备上的原始图片读回本地，而当前 iOS 没有留下
+> 这样做的通道。这不是本工具的限制没做完，是三层都不通：
 >
-> ```
-> com.apple.afc            -> 所有 /var 路径返回 error 8
-> com.apple.afc2           -> AMDeviceSecureStartService: -402653150
-> com.apple.mobilesync.AFC2-> AMDeviceSecureStartService: -402653150
-> ```
+> 1. **AFC 读不到卡包。** 在 iPhone17,1 / iOS 26.7 上实测：
+>    ```
+>    com.apple.afc            -> 所有 /var 路径返回 error 8
+>    com.apple.afc2           -> AMDeviceSecureStartService: -402653150
+>    com.apple.mobilesync.AFC2-> AMDeviceSecureStartService: -402653150
+>    ```
+>    `com.apple.afc` 只暴露 Media 沙箱，AFC2 服务被系统拒绝启动，而卡面包在
+>    `/var/mobile/Library/Passes/Cards/`，在沙箱之外。
+> 2. **AirTraffic 是单向的。** 它推送主机侧文件到设备路径，握手里没有让设备
+>    回传文件的消息。
+> 3. **写入会清理现场。** 传输走 Books 同步，跑完会删掉自己的暂存副本；
+>    `/Books/Sync/Artwork` 实测为 0 项，捞不回来。
 >
-> `com.apple.afc` 只暴露 Media 沙箱（`/DCIM`、`/Books`、`/Downloads`），
-> 能提供完整文件系统的 AFC2 服务被系统直接拒绝启动，而卡面包正好在
-> `/var/mobile/Library/Passes/Cards/`，在沙箱之外。
+> 所以**皮肤一旦写进去，原图就没了**，只能靠手动恢复。
 >
-> **应用卡片皮肤不受影响** —— 那条路走 AirTraffic，依然能写进卡面包。
-> 这也解释了为什么「能刷卡面，但不能备份原卡面」。
-> 我也验证过让 AirTraffic 把文件写到 AFC 能读到位置再取回：写入报告成功，
-> 但文件落在所有 AFC 可见路径之外，所以这条路也走不通。
->
-> 运行 `aircard.exe probe` 可以看到你这台设备的实际情况。如果它报告某个服务
-> 能读到卡片目录，那么下面的备份与恢复功能就是可用的。
+> 唯一的例外：如果你手上还有这张卡的 `.pkpass` 原始包（收到票证时
+> 「用其他应用打开」可存出，或从 iTunes 备份里翻），AirCard 会读取其中的
+> 真实图片名，并把原始图片存档到本地，方便日后手动写回。
 
-在 AFC 能访问 `/var` 的系统上，首次应用皮肤会保存一份原卡面的本地备份，
-之后 **恢复原卡面** 会把它写回去，并让钱包的缓存图片失效。
+**关于此前文档中的说法**：早先版本这里写的是「iOS 26/27 上不可用」，并称
+「AirTraffic 写入后 AFC 读不回来所以此路不通」。后半句是错的 ——
+`aircard.exe probe --roundtrip` 实测证明 AirTraffic 写的文件 AFC 能原样读回
+（位于 `airlift-src-<token>/payload`）。既然如此仍然无法恢复，原因不是读不回来，
+而是没有任何消息能让设备把卡包里的文件吐出来。特此更正，避免误导。
 
 ---
 

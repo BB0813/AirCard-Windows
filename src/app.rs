@@ -10,11 +10,14 @@ use image::DynamicImage;
 use crate::apple;
 use crate::corefp;
 use crate::device::{ConnectionMode, DeviceInfo, DeviceTransport, list_connected_devices};
-use crate::flasher::{flash_passcode_theme, flash_wallet_skin, restore_wallet_original};
+use crate::flasher::{flash_passcode_theme, flash_wallet_skin_slots, restore_wallet_original};
 use crate::i18n::Language;
 use crate::image_skin::{PreparedSkin, crop_uv_for_card};
 use crate::passthm::{PasscodeTheme, parse_passthm_file};
-use crate::scanner::{SavedCard, load_saved_cards, scan_syslog_for_cards};
+use crate::scanner::{
+    SavedCard, load_saved_cards, remove_saved_card, rename_saved_card, scan_syslog_for_cards,
+    set_last_skin,
+};
 use crate::wallet_backup::{backup_asset_count, backup_exists};
 
 /// Font sizes and control metrics, so the UI stays consistent instead of
@@ -114,6 +117,15 @@ pub struct AirCardApp {
     skin: Option<PreparedSkin>,
     scanning_syslog: bool,
     scan_stop_flag: Option<Arc<AtomicBool>>,
+    /// Rename state for the selected card: whether the dialog is open and the
+    /// text being edited. Kept here so the field is not rebuilt every frame.
+    rename_dialog_open: bool,
+    rename_buffer: String,
+    /// Pass slots the chosen skin should replace, read from a `.pkpass` the
+    /// user opened. Empty means the payment-card background trio.
+    pass_slots: Vec<String>,
+    /// Slots discovered in the last opened `.pkpass`, for the picker.
+    available_pass_slots: Vec<String>,
 
     // Passcode tab
     theme_path: Option<PathBuf>,
@@ -167,6 +179,10 @@ impl AirCardApp {
             skin: None,
             scanning_syslog: false,
             scan_stop_flag: None,
+            rename_dialog_open: false,
+            rename_buffer: String::new(),
+            pass_slots: Vec::new(),
+            available_pass_slots: Vec::new(),
 
             theme_path: None,
             loaded_theme: None,
@@ -340,6 +356,84 @@ impl AirCardApp {
             return false;
         }
         true
+    }
+
+    /// Read a `.pkpass` to learn which image slots the pass actually declares.
+    ///
+    /// This is the only way to know the real filenames: on current iOS the
+    /// device-side pass directory cannot be listed over AFC, so the names have
+    /// to come from the package the pass originally arrived in.
+    fn select_pass_package(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Pass packages", &["pkpass"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        self.add_log(format!("Reading pass package: {}", path.display()));
+        let package = match crate::passkit::PassPackage::open(&path) {
+            Ok(package) => package,
+            Err(err) => {
+                self.add_log(format!("Could not read pass package: {err:#}"));
+                self.status_msg = format!("Could not read pass package: {err:#}");
+                return;
+            }
+        };
+
+        // Preserve the originals first, while the package still holds them.
+        // The device-side directory cannot be read over AFC on current iOS, so
+        // this is the only place the untouched artwork exists.
+        let archive_dir = crate::wallet_backup::pass_archive_dir();
+        let archived = match package.archive_assets(&path, &archive_dir) {
+            Ok(n) => {
+                self.add_log(format!(
+                    "Archived {} original pass image(s) to {}",
+                    n,
+                    archive_dir.display()
+                ));
+                n
+            }
+            Err(err) => {
+                self.add_log(format!("Could not archive the original images: {err:#}"));
+                0
+            }
+        };
+
+        let slots = package.slots();
+        let manifest = if package.has_manifest() {
+            "pass.json present"
+        } else {
+            "no pass.json"
+        };
+        self.add_log(format!(
+            "Pass package has {} image asset(s) in {} slot(s) ({manifest}):",
+            package.assets().len(),
+            slots.len()
+        ));
+        for asset in package.assets() {
+            self.add_log(format!(
+                "    {} ({} bytes, slot {}{})",
+                asset.name,
+                asset.size,
+                asset.slot(),
+                asset.scale().unwrap_or("")
+            ));
+        }
+        self.available_pass_slots = slots;
+        self.pass_slots = self.available_pass_slots.clone();
+        self.status_msg = if archived > 0 {
+            format!(
+                "{} {}",
+                archived,
+                self.language
+                    .text("original image(s) archived; choose which slots to replace.")
+            )
+        } else {
+            self.language
+                .text("Pass package read; choose which slots to replace.")
+                .to_string()
+        };
     }
 
     fn select_skin(&mut self, ctx: &egui::Context) {
@@ -552,6 +646,26 @@ impl AirCardApp {
             .to_string();
         let connection_mode = self.connection_mode;
         let language = self.language;
+        // Chosen pass slots; empty means the payment-card background trio.
+        let pass_slots = self.pass_slots.clone();
+        if pass_slots.is_empty() {
+            self.add_log("Using default card-background slots.".to_string());
+        } else {
+            self.add_log(format!(
+                "Replacing {} pass slot(s): {}",
+                pass_slots.len(),
+                pass_slots.join(", ")
+            ));
+        }
+        // The skin's filename, recorded against the card once the flash lands,
+        // so the list can show what is currently applied.
+        let skin_name = self
+            .source_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        let hash_for_record = hash.clone();
         self.add_log(format!(
             "Starting card skin flash for hash: {} (UDID: {}, transport: {})",
             hash,
@@ -565,12 +679,16 @@ impl AirCardApp {
         thread::spawn(move || {
             let tx_progress = tx.clone();
             let tx_log = tx.clone();
-            let res = flash_wallet_skin(
+            let tx_record = tx.clone();
+            let name_for_record = skin_name.clone();
+            let hash_for_record = hash_for_record.clone();
+            let res = flash_wallet_skin_slots(
                 &udid,
                 connection_mode,
                 &hash,
                 &png_bytes,
                 &pdf_bytes,
+                &pass_slots,
                 move |step, total, msg| {
                     let _ = tx_progress.send(BackgroundTaskMessage::Progress {
                         step,
@@ -585,6 +703,16 @@ impl AirCardApp {
 
             match res {
                 Ok(()) => {
+                    // Only recorded once the write actually succeeded, so the
+                    // "last skin" line reflects the device and not the intent.
+                    set_last_skin(&hash_for_record, name_for_record.clone());
+                    let _ = tx_record.send(BackgroundTaskMessage::Log(format!(
+                        "Recorded {} as the last skin for card {}",
+                        name_for_record
+                            .clone()
+                            .unwrap_or_else(|| "(unnamed)".to_string()),
+                        hash_for_record
+                    )));
                     let _ = tx.send(BackgroundTaskMessage::Done(Ok(
                         language
                             .text("Card skin successfully flashed! Force quit Wallet on iPhone and reopen it.")
@@ -1437,6 +1565,49 @@ impl eframe::App for AirCardApp {
                 });
             });
 
+        // Rename dialog for the selected card, opened from the wallet tab.
+        if self.rename_dialog_open {
+            let mut open = self.rename_dialog_open;
+            egui::Window::new(language.text("Rename Card"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_size([320.0, 120.0])
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(language.text("Name for this card"))
+                            .size(type_scale::BODY)
+                            .color(md3::ON_SURFACE_VARIANT),
+                    );
+                    ui.add_space(4.0);
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.rename_buffer)
+                            .hint_text(language.text("Base64 pass hash..."))
+                            .desired_width(ui.available_width()),
+                    );
+                    if !response.has_focus() {
+                        response.request_focus();
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if m3_button_filled(ui, language.text("Save")) {
+                            rename_saved_card(
+                                self.card_hash.trim(),
+                                Some(self.rename_buffer.clone()),
+                            );
+                            self.saved_cards = load_saved_cards();
+                            self.rename_dialog_open = false;
+                        }
+                        if m3_button_outlined(ui, language.text("Cancel")) {
+                            self.rename_dialog_open = false;
+                        }
+                    });
+                });
+            if !open {
+                self.rename_dialog_open = false;
+            }
+        }
+
         let mut show_logs = self.show_logs_window;
         let mut file_saved_msg: Option<String> = None;
         if show_logs {
@@ -1633,7 +1804,7 @@ impl AirCardApp {
                         .saved_cards
                         .iter()
                         .find(|c| c.hash == self.card_hash)
-                        .map(|c| format!("{} ({})", c.name, &c.hash[..8.min(c.hash.len())]))
+                        .map(|c| c.display_name().to_string())
                         .unwrap_or_else(|| language.text("Select...").into());
 
                     egui::ComboBox::from_id_salt("saved_cards_box")
@@ -1642,9 +1813,12 @@ impl AirCardApp {
                         .show_ui(ui, |ui| {
                             for card in &self.saved_cards {
                                 let is_selected = self.card_hash == card.hash;
+                                // The scan name plus the hash prefix, so two cards
+                                // that both scanned as "Unknown" are still told
+                                // apart at a glance.
                                 let label = format!(
                                     "{} ({}...)",
-                                    card.name,
+                                    card.display_name(),
                                     &card.hash[..8.min(card.hash.len())]
                                 );
                                 let text = egui::RichText::new(label)
@@ -1659,6 +1833,51 @@ impl AirCardApp {
                                 }
                             }
                         });
+
+                    // Rename / forget the selected card. Without a rename, multiple
+                    // cards that all scanned as "Unknown" are indistinguishable in
+                    // the list.
+                    if !self.card_hash.trim().is_empty() && !self.saved_cards.is_empty() {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if m3_button_outlined(ui, language.text("Rename")) {
+                                self.rename_dialog_open = true;
+                                self.rename_buffer = self
+                                    .saved_cards
+                                    .iter()
+                                    .find(|c| c.hash == self.card_hash)
+                                    .and_then(|c| c.label.clone())
+                                    .unwrap_or_default();
+                            }
+                            if m3_button_outlined(ui, language.text("Forget")) {
+                                remove_saved_card(self.card_hash.trim());
+                                self.saved_cards = load_saved_cards();
+                                self.card_hash.clear();
+                                self.add_log(
+                                    language
+                                        .text("Card removed from the saved list.")
+                                        .to_string(),
+                                );
+                            }
+                        });
+                    }
+
+                    // What was last applied to the selected card, so re-applying an
+                    // older skin is a choice rather than a guess.
+                    if let Some(card) = self.saved_cards.iter().find(|c| c.hash == self.card_hash) {
+                        if let Some(skin) = &card.last_skin {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} {}",
+                                    language.text("Last skin:"),
+                                    skin
+                                ))
+                                .size(type_scale::CAPTION)
+                                .color(md3::ON_SURFACE_VARIANT),
+                            );
+                        }
+                    }
                 }
 
                 ui.add_space(16.0);
@@ -1693,6 +1912,49 @@ impl AirCardApp {
                         }
                     }
                 });
+
+                // Opening the pass package reveals which image slots the pass
+                // really declares, which is otherwise unknowable on iOS 26+.
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if m3_button_outlined(ui, language.text("Open .pkpass...")) {
+                        self.select_pass_package();
+                    }
+                    if !self.available_pass_slots.is_empty()
+                        && m3_button_outlined(ui, language.text("Use Defaults"))
+                    {
+                        self.pass_slots.clear();
+                        self.available_pass_slots.clear();
+                        self.add_log(
+                            language
+                                .text("Cleared slot selection; the card background will be used.")
+                                .to_string(),
+                        );
+                    }
+                });
+
+                if !self.available_pass_slots.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(language.text("Slots to replace"))
+                            .strong()
+                            .size(type_scale::SECTION)
+                            .color(md3::ON_SURFACE),
+                    );
+                    ui.add_space(2.0);
+                    // Real asset names, so what gets written is exactly what the
+                    // pass package declared.
+                    for slot in &self.available_pass_slots {
+                        let mut on = self.pass_slots.contains(slot);
+                        if ui.checkbox(&mut on, slot.as_str()).changed() {
+                            if on {
+                                self.pass_slots.push(slot.clone());
+                            } else {
+                                self.pass_slots.retain(|s| s != slot);
+                            }
+                        }
+                    }
+                }
 
                 if let Some(skin) = &self.skin {
                     ui.add_space(4.0);
@@ -1828,7 +2090,7 @@ impl AirCardApp {
                 } else if !self.card_hash.trim().is_empty() && self.selected_udid.is_some() {
                     ui.label(
                                 egui::RichText::new(language.text(
-                                    "Restore unavailable: this iOS build does not let AFC read /var, so the original artwork cannot be saved.",
+                                    "Restore unavailable: no channel can read the card artwork back off this iOS build. A skin, once applied, cannot be undone here.",
                                 ))
                                 .size(type_scale::CAPTION)
                                 .color(md3::ON_SURFACE_VARIANT),

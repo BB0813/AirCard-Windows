@@ -120,8 +120,8 @@ impl Language {
             "No original backup yet - applying a skin captures it automatically." => {
                 "尚无原卡面备份 - 应用皮肤时会自动备份。"
             }
-            "Restore unavailable: this iOS build does not let AFC read /var, so the original artwork cannot be saved." => {
-                "无法恢复：此 iOS 版本不允许 AFC 读取 /var，因此无法保存原始卡面。"
+            "Restore unavailable: no channel can read the card artwork back off this iOS build. A skin, once applied, cannot be undone here." => {
+                "无法恢复：当前 iOS 上没有任何通道能把卡片图片读回来。皮肤一旦应用，在此无法撤销。"
             }
             "original asset(s) backed up" => "个原始资产已备份",
             "Passcode theme applied successfully!" => "锁屏密码主题应用成功！",
@@ -150,6 +150,29 @@ impl Language {
             "Target Card Hash" => "目标卡片 Hash",
             "Base64 pass hash..." => "Base64 卡片 Hash...",
             "Saved cards" => "已保存的卡片",
+            "Rename" => "重命名",
+            "Open .pkpass..." => "打开 .pkpass...",
+            "Use Defaults" => "使用默认",
+            "Slots to replace" => "要替换的图片位",
+            "Pass package read; choose which slots to replace." => {
+                "已读取 pass 包，请选择要替换的图片位。"
+            }
+            "original image(s) archived; choose which slots to replace." => {
+                "个原始图片已存档，请选择要替换的图片位。"
+            }
+            "Cleared slot selection; the card background will be used." => {
+                "已清除图片位选择，将只替换卡片背景。"
+            }
+            "Using default card-background slots." => "使用默认的卡片背景图片位。",
+            "Replacing {} pass slot(s): {}" => "正在替换 {} 个图片位：{}",
+            "Recorded {} as the last skin for card {}" => "已记录 {} 为卡片 {} 的上次皮肤",
+            "Forget" => "移除",
+            "Rename Card" => "重命名卡片",
+            "Name for this card" => "为此卡片命名",
+            "Save" => "保存",
+            "Cancel" => "取消",
+            "Last skin:" => "上次皮肤：",
+            "Card removed from the saved list." => "已从保存列表中移除该卡片。",
             "Select..." => "请选择...",
             "Card Skin Artwork" => "卡片皮肤图片",
             "PNG, JPG, WebP - auto-scaled to 1536x969" => "PNG、JPG、WebP，将自动缩放到 1536x969",

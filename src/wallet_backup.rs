@@ -27,6 +27,15 @@ pub fn backup_root_for_probe() -> PathBuf {
     backup_root()
 }
 
+/// Where original pass images are archived, next to the wallet backups.
+///
+/// The device-side pass directory cannot be read over AFC on current iOS, so
+/// the `.pkpass` the pass arrived in is the only place the untouched artwork
+/// still exists. Keeping a copy means a skin can be undone by hand.
+pub fn pass_archive_dir() -> PathBuf {
+    backup_root().join("pass-originals")
+}
+
 fn local_app_data() -> PathBuf {
     std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -233,10 +242,12 @@ where
     let card_dirs = discover_card_dirs(&afc, card_hash);
     if card_dirs.is_empty() {
         if afc_sandbox_is_closed(&afc) {
-            log(
-                "This iOS build does not let AFC read /var, so the original card artwork cannot be copied off the device.",
-            );
-            log("Restoring the original face is therefore unavailable for this device.");
+            // State what is actually blocked. AFC not reaching /var is only one
+            // of the reasons; the decisive one is that nothing asks the device to
+            // send the card bundle outward. Saying "AFC cannot read /var" alone
+            // implies a read-back would fix it, which it would not.
+            log("No channel can copy the card artwork off this device: AFC cannot reach /var, and nothing asks the device to send the bundle out.");
+            log("The original card face cannot be preserved, so restoring it is unavailable.");
             return Ok(None);
         }
         log(&format!(

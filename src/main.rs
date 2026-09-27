@@ -13,6 +13,7 @@ mod device;
 mod flasher;
 mod i18n;
 mod image_skin;
+mod passkit;
 mod passthm;
 mod probe;
 mod scanner;

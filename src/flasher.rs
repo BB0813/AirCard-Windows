@@ -56,6 +56,57 @@ pub fn write_system_file<L>(
 where
     L: FnMut(&str),
 {
+    write_system_file_inner(
+        udid,
+        connection_mode,
+        target_dir,
+        leaf_name,
+        payload,
+        &mut log,
+        true,
+    )
+}
+
+/// Writes a file and leaves the staging directories in place.
+///
+/// `write_system_file` removes what it staged as soon as it returns, which makes
+/// the transfer's own output invisible to any later AFC read. The probe needs to
+/// observe what AirTraffic actually produced, so it asks for the staging to be
+/// kept and cleans up itself.
+pub fn write_system_file_keep_staging<L>(
+    udid: &str,
+    connection_mode: ConnectionMode,
+    target_dir: &str,
+    leaf_name: &str,
+    payload: &[u8],
+    mut log: L,
+) -> Result<()>
+where
+    L: FnMut(&str),
+{
+    write_system_file_inner(
+        udid,
+        connection_mode,
+        target_dir,
+        leaf_name,
+        payload,
+        &mut log,
+        false,
+    )
+}
+
+fn write_system_file_inner<L>(
+    udid: &str,
+    connection_mode: ConnectionMode,
+    target_dir: &str,
+    leaf_name: &str,
+    payload: &[u8],
+    mut log: L,
+    clean_up_staging: bool,
+) -> Result<()>
+where
+    L: FnMut(&str),
+{
     let token = generate_token();
     let source = format!("{}{}", SOURCE_PREFIX, token);
     let link_dest = format!("{}{}", LINK_PREFIX, token);
@@ -119,10 +170,12 @@ where
         Ok(())
     })();
 
-    let _ = afc.remove_path(&link_dest);
-    let _ = afc.remove_path(&recovered);
-    let _ = afc.remove_tree(&source);
-    sleep(Duration::from_millis(800));
+    if clean_up_staging {
+        let _ = afc.remove_path(&link_dest);
+        let _ = afc.remove_path(&recovered);
+        let _ = afc.remove_tree(&source);
+        sleep(Duration::from_millis(800));
+    }
 
     let restore_res = restore_books(&afc, &snapshot);
 
@@ -259,12 +312,25 @@ where
     Ok(())
 }
 
-pub fn flash_wallet_skin<F, L>(
+/// Asset names Wallet expects on a payment card, in the order they are written.
+pub const DEFAULT_WALLET_SLOTS: [&str; 3] = [
+    "cardBackgroundCombined@3x.png",
+    "cardBackgroundCombined@2x.png",
+    "cardBackgroundCombined.pdf",
+];
+
+/// Flash a skin into chosen pass slots.
+///
+/// `slots` is a list of filenames as they appear in the pass package, e.g.
+/// `["logo@2x.png", "strip.png"]`. An empty list means the card-background trio,
+/// which is the payment-card default.
+pub fn flash_wallet_skin_slots<F, L>(
     udid: &str,
     connection_mode: ConnectionMode,
     card_hash: &str,
     skin_png: &[u8],
     skin_pdf: &[u8],
+    slots: &[String],
     mut progress: F,
     mut log: L,
 ) -> Result<()>
@@ -296,11 +362,32 @@ where
     );
     log("[1/3] Writing card artwork assets (@3x.png, @2x.png, cardBackgroundCombined.pdf)...");
 
-    let card_assets: [(&str, &[u8]); 3] = [
-        ("cardBackgroundCombined@3x.png", skin_png),
-        ("cardBackgroundCombined@2x.png", skin_png),
-        ("cardBackgroundCombined.pdf", skin_pdf),
-    ];
+    // Slot names to write, in order. The card-background trio is what Wallet
+    // renders for a payment card; other pass types use different slots, so the
+    // caller may pass a different list - an empty one means the default.
+    let slots: Vec<String> = if slots.is_empty() {
+        DEFAULT_WALLET_SLOTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        slots.to_vec()
+    };
+
+    let mut card_assets: Vec<(String, Vec<u8>)> = Vec::with_capacity(slots.len());
+    for slot in &slots {
+        match slot.as_str() {
+            "cardBackgroundCombined@2x.png" => card_assets.push((slot.clone(), skin_png.to_vec())),
+            "cardBackgroundCombined.pdf" => card_assets.push((slot.clone(), skin_pdf.to_vec())),
+            // Any other slot gets the still image; the PDF only applies to the
+            // card background, which Apple renders as vector.
+            _ => card_assets.push((slot.clone(), skin_png.to_vec())),
+        }
+    }
+    let card_assets: Vec<(&str, &[u8])> = card_assets
+        .iter()
+        .map(|(name, data)| (name.as_str(), data.as_slice()))
+        .collect();
 
     if let Err(err) =
         write_system_files_batch(udid, connection_mode, &pkpass_dir, &card_assets, &mut log)

@@ -23,6 +23,23 @@ const SO_RCVTIMEO: i32 = 0x1006;
 pub struct SavedCard {
     pub hash: String,
     pub name: String,
+    /// Display name the user gave this card, if any. Scan-derived names are
+    /// often "Unknown" or a generic label, so a user-set name always wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Filename of the skin last applied to this card, for the history list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_skin: Option<String>,
+}
+
+impl SavedCard {
+    /// The name to show in lists: the user's label if set, else the scan name.
+    pub fn display_name(&self) -> &str {
+        self.label
+            .as_deref()
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or(&self.name)
+    }
 }
 
 pub fn get_cards_storage_path() -> PathBuf {
@@ -33,106 +50,116 @@ pub fn get_cards_storage_path() -> PathBuf {
     dir.join("cards.json")
 }
 
+/// Decides whether a string seen in syslog is a real Wallet card hash.
+///
+/// The structural test comes first: a Wallet card hash is base64 that decodes to
+/// exactly 20 or 32 bytes with cryptographic-hash entropy. Noise from iOS
+/// subsystems - bundle IDs, asset names, log tags - almost always fails one of
+/// those outright, so it never reaches the keyword list.
+///
+/// The keyword list is a last-resort net for noise that happens to be shaped
+/// like a hash. It used to be the primary filter, which meant every iOS release
+/// that introduced new subsystem names required editing it by hand.
 pub fn is_valid_card_hash(h: &str) -> bool {
-    let trimmed = h.trim_matches(['\'', '"']).trim_end_matches(['.', ',']);
-    let len = trimmed.len();
-    // Real Apple Wallet card hashes are SHA-1 (27-28 chars) or SHA-256 (43-44 chars)
-    if len != 27 && len != 28 && len != 43 && len != 44 {
+    let Some(decoded) = decode_card_hash(h) else {
+        return false;
+    };
+
+    // A cryptographic hash is uniformly distributed. These two checks separate
+    // that from an identifier that merely happens to be 20 or 32 bytes long.
+    let has_high = decoded.iter().any(|&b| b >= 128);
+    let has_low = decoded.iter().any(|&b| b < 128);
+    if !has_high || !has_low {
         return false;
     }
 
-    // Must be base64 alphabet characters
+    let unique_bytes: std::collections::HashSet<u8> = decoded.iter().copied().collect();
+    // 20 bytes of SHA-1 concentrate well above 12 distinct values; a
+    // human-readable identifier does not.
+    let min_distinct = (decoded.len() / 2).max(8);
+    if unique_bytes.len() < min_distinct {
+        return false;
+    }
+
+    if decoded.iter().all(|&b| b == decoded[0]) {
+        return false;
+    }
+
+    let trimmed = h
+        .trim_matches(['\'', '"'])
+        .trim_end_matches(['.', ','])
+        .trim();
+    !is_known_noise(trimmed)
+}
+
+/// Decode a candidate into the 20 or 32 bytes a card hash must contain.
+fn decode_card_hash(h: &str) -> Option<Vec<u8>> {
+    let trimmed = h
+        .trim_matches(['\'', '"'])
+        .trim_end_matches(['.', ','])
+        .trim();
+    let len = trimmed.len();
+    // SHA-1 (27-28 chars) or SHA-256 (43-44 chars) in base64.
+    if len != 27 && len != 28 && len != 43 && len != 44 {
+        return None;
+    }
+
     if !trimmed.chars().all(|c| {
         c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '-' || c == '_' || c == '='
     }) {
-        return false;
+        return None;
     }
 
-    // Reject strings with multiple underscores or hyphens (typical of system asset/bundle names)
-    if trimmed.chars().filter(|&c| c == '_').count() > 1
-        || trimmed.chars().filter(|&c| c == '-').count() > 2
-    {
-        return false;
-    }
-
-    // Reject obvious system identifiers, bundle IDs and common keywords
-    let lower = trimmed.to_lowercase();
-    if lower.contains("mobileasset")
-        || lower.contains("com_apple")
-        || lower.contains("com.")
-        || lower.contains("apple.")
-        || lower.contains("curtain")
-        || lower.contains("binder")
-        || lower.contains("optimizer")
-        || lower.contains("system")
-        || lower.contains("uaf")
-        || lower.contains("siri")
-        || lower.contains("dialog")
-        || lower.contains("planner")
-        || lower.contains("linguistic")
-        || lower.contains("timing")
-        || lower.contains("model")
-        || lower.contains("translation")
-        || lower.contains("visual")
-        || lower.contains("device")
-        || lower.contains("override")
-        || lower.contains("motion")
-        || lower.contains("search")
-    {
-        return false;
-    }
-
-    // '=' can only appear at the end
+    // '=' is only ever padding, so it cannot appear mid-string.
     if let Some(pos) = trimmed.find('=') {
         if pos < len - 2 {
-            return false;
+            return None;
         }
     }
 
-    // Normalize URL-safe base64 and pad
+    // A hash has no word structure: it carries no separators. Subsystem names
+    // and bundle IDs are built from them (`com_apple_MobileAsset_...`), and one
+    // of those happens to be exactly 43 characters - the SHA-256 base64 length -
+    // so length and entropy alone let it through.
+    if trimmed.chars().filter(|&c| c == '_').count() > 1
+        || trimmed.chars().filter(|&c| c == '-').count() > 2
+    {
+        return None;
+    }
+
+    // Accept both alphabets; Wallet hashes appear in either.
     let mut b64 = trimmed.replace('-', "+").replace('_', "/");
     while b64.len() % 4 != 0 {
         b64.push('=');
     }
 
     use base64::Engine;
-    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&b64) {
-        // Must be exactly 20 bytes (SHA-1) or 32 bytes (SHA-256)
-        if decoded.len() == 20 || decoded.len() == 32 {
-            // Reject trivial all-identical bytes
-            if decoded.iter().all(|&b| b == decoded[0]) {
-                return false;
-            }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&b64))
+        .ok()?;
 
-            // Cryptographic hashes have high byte entropy:
-            // 1. Must contain both bytes with MSB set (>= 128) and MSB clear (< 128).
-            let has_high = decoded.iter().any(|&b| b >= 128);
-            let has_low = decoded.iter().any(|&b| b < 128);
-            if !has_high || !has_low {
-                return false;
-            }
+    (decoded.len() == 20 || decoded.len() == 32).then_some(decoded)
+}
 
-            // 2. Must contain at least 12 distinct byte values in 20 bytes
-            let mut unique_bytes = std::collections::HashSet::new();
-            for &b in &decoded {
-                unique_bytes.insert(b);
-            }
-            if unique_bytes.len() < 12 {
-                return false;
-            }
-
-            if DUMMY_HASHES.contains(&trimmed)
-                || DUMMY_HASHES
-                    .iter()
-                    .any(|d| d.trim_end_matches('=') == trimmed)
-            {
-                return false;
-            }
-            return true;
-        }
+/// Strings that pass the structural test but are not card hashes.
+///
+/// Kept deliberately short. Anything listed here is a case the entropy and
+/// length rules let through - if a new noise source needs adding, the real fix
+/// is a better structural rule, not another keyword.
+fn is_known_noise(trimmed: &str) -> bool {
+    // Wallet's own placeholder hashes, which it logs on paths that carry no card.
+    if DUMMY_HASHES.contains(&trimmed)
+        || DUMMY_HASHES
+            .iter()
+            .any(|d| d.trim_end_matches('=') == trimmed)
+    {
+        return true;
     }
 
-    false
+    // Bundle IDs and asset names: separators no card hash uses.
+    let lower = trimmed.to_lowercase();
+    lower.contains("com.") || lower.contains("apple.")
 }
 
 pub fn load_saved_cards() -> Vec<SavedCard> {
@@ -171,6 +198,8 @@ pub fn add_or_update_card(hash: &str, name: &str) {
     }
     let mut cards = load_saved_cards();
     if let Some(existing) = cards.iter_mut().find(|c| c.hash == hash) {
+        // Only fill in a real name; a user-set label is never overwritten,
+        // because `display_name` prefers it.
         if !name.is_empty() && (existing.name.is_empty() || existing.name.starts_with("Card ")) {
             existing.name = name.to_string();
         }
@@ -182,8 +211,37 @@ pub fn add_or_update_card(hash: &str, name: &str) {
             } else {
                 name.to_string()
             },
+            label: None,
+            last_skin: None,
         });
     }
+    save_saved_cards(&cards);
+}
+
+/// Rename a saved card. An empty label clears it, falling back to the scan name.
+pub fn rename_saved_card(hash: &str, label: Option<String>) {
+    let mut cards = load_saved_cards();
+    if let Some(card) = cards.iter_mut().find(|c| c.hash == hash) {
+        card.label = label
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty());
+        save_saved_cards(&cards);
+    }
+}
+
+/// Record which skin was last applied to a card.
+pub fn set_last_skin(hash: &str, skin: Option<String>) {
+    let mut cards = load_saved_cards();
+    if let Some(card) = cards.iter_mut().find(|c| c.hash == hash) {
+        card.last_skin = skin;
+        save_saved_cards(&cards);
+    }
+}
+
+/// Drop a card from the saved list.
+pub fn remove_saved_card(hash: &str) {
+    let mut cards = load_saved_cards();
+    cards.retain(|c| c.hash != hash);
     save_saved_cards(&cards);
 }
 
@@ -422,6 +480,49 @@ mod tests {
                 "Expected {} to be rejected as card hash",
                 g
             );
+        }
+    }
+
+    /// Length and entropy alone are not enough.
+    ///
+    /// `com_apple_MobileAsset_UAF_Siri_DialogAssets` is 43 characters - exactly
+    /// the SHA-256 base64 length - and decodes to 32 bytes with plausible
+    /// entropy, so it passes every structural check except the separator rule.
+    /// Without that rule it is captured as a card. This test exists so the rule
+    /// is not dropped again on the assumption that entropy covers it.
+    #[test]
+    fn noise_that_looks_structurally_valid_is_still_rejected() {
+        let structurally_valid_noise = [
+            "com_apple_MobileAsset_UAF_Siri_DialogAssets",
+            "com_apple_MobileAsset_UAF_VisualIntelligence",
+            "com_apple_MobileAsset_UAF_Siri_TextToSpeech",
+        ];
+        for sample in structurally_valid_noise {
+            // Either base64 width for 32 bytes counts as SHA-256 shaped.
+            assert!(
+                sample.len() == 43 || sample.len() == 44,
+                "sample is meant to be SHA-256 shaped"
+            );
+            assert!(
+                !is_valid_card_hash(sample),
+                "Expected {sample} to be rejected - it is a bundle name, not a hash"
+            );
+        }
+    }
+
+    /// A real card hash carries no separators at all, in either alphabet.
+    #[test]
+    fn real_hashes_have_no_separators() {
+        for hash in [
+            "d64fKk0kyHWP11IWV2GRLud4XQk=",
+            "OM6NYhwXMZrAw0sRUjR62wmF4ZQ=",
+            "ZG+pLeL8u+lORdfO1J481gIgnPk=",
+        ] {
+            assert!(
+                !hash.contains('_') && !hash.contains('-'),
+                "{hash} was assumed to be separator-free"
+            );
+            assert!(is_valid_card_hash(hash), "{hash} should be accepted");
         }
     }
 
