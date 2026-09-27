@@ -203,7 +203,7 @@ impl AirCardApp {
             show_logs_window: false,
         };
 
-        app.add_log("AirCard Windows v1.3.0 initialized");
+        app.add_log("AirCard Windows v1.4.0 initialized");
         app.add_log(format!(
             "Apple Support Runtime: {}",
             if app.apple_ready {
@@ -1320,7 +1320,7 @@ impl eframe::App for AirCardApp {
                             .color(md3::ON_SURFACE),
                     );
                     ui.label(
-                        egui::RichText::new("v1.3.0")
+                        egui::RichText::new("v1.4.0")
                             .size(type_scale::CAPTION)
                             .color(md3::ON_SURFACE_VARIANT),
                     );
