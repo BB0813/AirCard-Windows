@@ -16,6 +16,7 @@ mod image_skin;
 mod passkit;
 mod passthm;
 mod probe;
+mod probe_pass;
 mod scanner;
 mod wallet_backup;
 
@@ -36,6 +37,12 @@ fn main() -> eframe::Result<()> {
     // `aircard.exe probe` runs a read-only device inspection and exits. It is a
     // diagnostic aid for reports where a backup or transfer fails: it prints
     // what the device actually exposes instead of requiring a screenshot.
+    if std::env::args().nth(1).as_deref() == Some("probe-pass") {
+        #[cfg(windows)]
+        attach_console();
+        probe_pass::run();
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("probe") {
         #[cfg(windows)]
         attach_console();
